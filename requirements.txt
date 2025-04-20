@@ -1,0 +1,18 @@
+# Core libraries
+numpy
+torch
+jupyter
+scikit-learn
+matplotlib
+
+# Excel and data processing libraries
+pandas
+openpyxl
+xlrd
+
+# Optional: May be required to handle SSL certificates in certain environments
+# Uncomment the following line if encountering SSL certificate verification errors
+# certifi
+
+# If you encounter SSL certificate verification errors on macOS, run:
+# export SSL_CERT_FILE="$(python3 -m certifi)"
