@@ -4,8 +4,6 @@
 # A PyTorch implementation of the Error‑Diffusion Learning Algorithm (EDLA).
 #
 # Author: Kazuhisa Fujita
-# Since : 2024/09/03
-# Update: 2025/04/20
 # --------------------------------------------------------------
 """
 Overview
