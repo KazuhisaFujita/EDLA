@@ -281,15 +281,16 @@ class EDLA(nn.Module):
                                       # M = 2 * width of layer l (positive and negative sublayers)
             _, K = outputs[l+1].shape # batch size, number of neurons in layer l+1
                                       # K = 2 * width of layer l+1 (positive and negative sublayers)
-
+                                      
+            M_half = M // 2          # half of the number of neurons in layer l
 
             # ----- Avoid to change the sign of the weights -----
             # This process is not used in the current implementation
             # As long as using the Sigmoid and ReLU activation functions and the MSE loss function, signs of the weights are not changed.
-            # layer.fc_p.weight.data[:M//2].clamp_(min=0)
-            # layer.fc_p.weight.data[M//2:].clamp_(max=0)
-            # layer.fc_n.weight.data[:M//2].clamp_(max=0)
-            # layer.fc_n.weight.data[M//2:].clamp_(min=0)
+            # layer.fc_p.weight.data[:M_half].clamp_(min=0)
+            # layer.fc_p.weight.data[M_half:].clamp_(max=0)
+            # layer.fc_n.weight.data[:M_half].clamp_(max=0)
+            # layer.fc_n.weight.data[M_half:].clamp_(min=0)
 
 
             # ----- positive phase (d > 0) -----
@@ -306,7 +307,7 @@ class EDLA(nn.Module):
             # Update the weight from the positive sublayer (not including the bias)
             # \eta * output of layer l * derivative of layer l+1
             buf.p_w.add_(self.learning_rate * torch.sum(
-                self.dw(d_pos, act_func(outputs[l][:, :M//2].view(B, 1, M//2), activation_fn=self.activation_fns[l]),
+                self.dw(d_pos, act_func(outputs[l][:, :M_half].view(B, 1, M_half), activation_fn=self.activation_fns[l]),
                         d_activation(outputs[l+1].view(B, K, 1), activation_fn=self.activation_fns[l+1]), layer.fc_p.weight.data),
                 dim=0))
 
@@ -333,7 +334,7 @@ class EDLA(nn.Module):
             # dw^{nn, (l)}_{ji} = \eta (-d) * g'(a^{p, (l)}_j) z^{n, (l-1)}_i sign(w^{pn, (l)}_{ji}) < 0
             # Therefore, w^{pn, (l)}_{ji} is updated in negative direction.
             buf.n_w.add_(self.learning_rate * torch.sum(
-                self.dw(d_neg, act_func(outputs[l][:, M//2:].view(B, 1, M//2), activation_fn=self.activation_fns[l]),
+                self.dw(d_neg, act_func(outputs[l][:, M_half:].view(B, 1, M_half), activation_fn=self.activation_fns[l]),
                         d_activation(outputs[l+1].view(B, K, 1), activation_fn=self.activation_fns[l+1]), layer.fc_n.weight.data),
                 dim=0))
 
