@@ -17,8 +17,8 @@ EDLA at a glance
 ----------------
 * **Motivation** EDLA is a biologically-motivated alternative to backpropagation. It learns with a *single global error signal* that diffuses thoughout the network.
 * **Network layout** Each *EDLayer* doubles the number of logical units so that every logical neuron is represented by a pair of positive and negative neurons in a positive sublayer and a negative sublayer, respectively. The weights between same types of neurons are excitatory, while the weights between different types of neurons are inhibitory.
-* **Weight constraints** Connections are pre‑initialised so that excitatory synapses are positive while inhibitory synapses are negative. Training preserves these sign constraints.
-* **Learning rule** Weights update in proportion to the *sign* of the current weight, the presynaptic activation, the derivative of the postsynaptic activation, and the *global error* *d*.
+* **Weight constraints** Connections are pre-initialised so that excitatory synapses are positive while inhibitory synapses are negative. Training preserves these sign constraints.
+* **Learning rule** Weights update in proportion to the *sign* of the current weight, the presynaptic activation, the derivative of the postsynaptic activation, and the *global error* *d*.
 
 File organisation
 -----------------
@@ -39,10 +39,7 @@ Notes
 # ============================
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.nn.init as init
-import os
-import numpy as np
 
 # -------------------------------------------------------------
 # Generic helper functions
@@ -76,14 +73,16 @@ def d_activation(x, activation_fn="Sigmoid", negative_slope=0.01, beta=1.0):
         return (x > 0).float()
     elif activation_fn == "ReLU6":
         # Derivative is 1 for 0 < x < 6, else 0
-        return ((x > 0) & (x < 6)).float()
+        return ((x > 0) & (x < 6)).to(x.dtype)
     elif activation_fn == "LeakyReLU":
         # For LeakyReLU: derivative is 1 where x > 0, else negative_slope
-        return (x > 0).float() + (x <= 0).float() * negative_slope
+        return torch.where(x > 0,
+                        torch.ones_like(x),
+                        torch.full_like(x, negative_slope))
     if activation_fn == "Tanh":
         return 1 - torch.tanh(x) ** 2
     elif activation_fn == "None":
-        return torch.ones(x.shape).to(x.device)
+        return torch.ones_like(x)
     else:
         print("Error")
 
@@ -139,8 +138,24 @@ class EDLayer(nn.Module):
     # Forward pass
     def forward(self, x):# x = [x_p, x_n]
         # Split input into excitatory and inhibitory parts, pass through respective layers, and sum results
-        x_p, x_n = torch.chunk(x, 2, dim=1) #split input
-        return self.fc_p(x_p) + self.fc_n(x_n)
+        _, M = x.shape
+        return self.fc_p(x[:,:M//2]) + self.fc_n(x[:,M//2:])
+
+
+# --------------------------------------------------
+# helper: holds 4 update buffers but勾配は追跡しない
+# --------------------------------------------------
+class _EDUpdateBuf(nn.Module):
+    def __init__(self, layer: EDLayer):
+        super().__init__()
+        self.register_buffer("p_w", torch.zeros_like(layer.fc_p.weight))
+        self.register_buffer("p_b", torch.zeros_like(layer.fc_p.bias))
+        self.register_buffer("n_w", torch.zeros_like(layer.fc_n.weight))
+        self.register_buffer("n_b", torch.zeros_like(layer.fc_n.bias))
+
+    def zero_(self):
+        for buf in self.buffers():
+            buf.zero_()
 
 # --------------------------------------------------------------
 # EDLA
@@ -180,9 +195,9 @@ class EDLA(nn.Module):
             self.layers.append(EDLayer(input_size, hidden_size))
             for i in range(hidden_layers-1):
                 self.layers.append(EDLayer(hidden_size, hidden_size))
-            self.layers.append(EDLayer(hidden_size, output_size))
+            self.layers.append(EDLayer(hidden_size, output_size, last_layer=True))
         else:
-            self.layers.append(EDLayer(input_size, output_size))
+            self.layers.append(EDLayer(input_size, output_size, last_layer=True))
 
         self.num_layers = len(self.layers)
 
@@ -195,6 +210,9 @@ class EDLA(nn.Module):
             self.activation_fns.append(activation_fn)
         self.activation_fns.append(last_activation_fn)
 
+        # Initialize buffer for weight updates
+        # The buffer is used to store the weight updates for each layer
+        self._dw_buf = nn.ModuleList([_EDUpdateBuf(lyr) for lyr in self.layers])
     
     # -- Forward pass --
     def forward(self, x):
@@ -217,7 +235,8 @@ class EDLA(nn.Module):
 
         # Split output into excitatory and inhibitory parts, and return the excitatory part
         # x = [x^L+, x^L-] -> x^L+, outputs = [input, activation of hidden layer 1, ..., activation of hidden layer N]
-        return torch.chunk(x,2, dim=1)[0], outputs 
+        
+        return x, outputs 
 
 
     # -- Computer differential weight --
@@ -235,34 +254,6 @@ class EDLA(nn.Module):
         dw *= d.unsqueeze(-1)
         return dw
 
-    # -- Set weights to zero based on their sign --
-    # This function is not used in the current implementation
-    # As long as using the Sigmoid and ReLU activation functions and the MSE loss function, signs of the weights are not changed.
-    # def set_zero(self, w, excitation = True):
-    #     if w.dim() == 2: # weight
-    #         if excitation:
-    #             condition = w  > 0
-    #             condition[condition.shape[0]//2:, :] = True
-    #             w *= condition
-    #         else:
-    #             condition = w  < 0
-    #             condition[:condition.shape[0]//2, :] = True
-    #             w *= condition
-    #         return w
-    #     elif w.dim() == 1: # bias
-    #         if excitation:
-    #             condition = w > 0
-    #             condition[condition.shape[0]//2:] = True
-    #             w *= condition
-    #         else:
-    #             condition = w < 0
-    #             condition[:condition.shape[0]//2] = True
-    #             w *= condition
-    #         return w
-    #     else:
-    #         print("Error")
-
-
     # -- Update model weights --
     def update(self, model, input_data, target):
         # Run forward pass
@@ -278,24 +269,28 @@ class EDLA(nn.Module):
     # -- Update model weights --
     def update_core(self, model, outputs, diff):
         # Initialize weight updates
-        # dw is the sum of the weight updates for each layer
-        dw_sum = {}
-        for l in range(self.num_layers):
-            layer = model.layers[l]
-            dw_sum[l] = {
-                'fc_p_weight': torch.zeros_like(layer.fc_p.weight),
-                'fc_p_bias'  : torch.zeros_like(layer.fc_p.bias),
-                'fc_n_weight': torch.zeros_like(layer.fc_n.weight),
-                'fc_n_bias'  : torch.zeros_like(layer.fc_n.bias)
-            }
+        for buf in self._dw_buf:
+            buf.zero_()
 
         # Loop through each layer and compute the weight updates
         for l in range(self.num_layers):
             layer = model.layers[l]
+            buf = self._dw_buf[l]
+
             B, M = outputs[l].shape   # batch size, number of neurons in layer l
                                       # M = 2 * width of layer l (positive and negative sublayers)
             _, K = outputs[l+1].shape # batch size, number of neurons in layer l+1
                                       # K = 2 * width of layer l+1 (positive and negative sublayers)
+
+
+            # ----- Avoid to change the sign of the weights -----
+            # This process is not used in the current implementation
+            # As long as using the Sigmoid and ReLU activation functions and the MSE loss function, signs of the weights are not changed.
+            # layer.fc_p.weight.data[:M//2].clamp_(min=0)
+            # layer.fc_p.weight.data[M//2:].clamp_(max=0)
+            # layer.fc_n.weight.data[:M//2].clamp_(max=0)
+            # layer.fc_n.weight.data[M//2:].clamp_(min=0)
+
 
             # ----- positive phase (d > 0) -----
             # d > 0 means that the output is smaller than the target when using the MSE loss function
@@ -304,24 +299,22 @@ class EDLA(nn.Module):
             # The positive sublayer is the first half of the weight matrix
         
             # Create a mask for samples where the global error signal is positive (i.e., output < target)
-            mask = (diff > 0)
             # Set diff to zero for samples where the global error signal is negative
             # This is done to avoid updating the weights for these samples
-            d = diff * mask
+            d_pos = diff.clamp_min(0)
 
             # Update the weight from the positive sublayer (not including the bias)
             # \eta * output of layer l * derivative of layer l+1
-            dw_sum[l]['fc_p_weight'] += self.learning_rate * torch.sum(
-                self.dw(d, act_func(outputs[l][:, :M//2].view(B, 1, M//2), activation_fn=self.activation_fns[l]),
+            buf.p_w.add_(self.learning_rate * torch.sum(
+                self.dw(d_pos, act_func(outputs[l][:, :M//2].view(B, 1, M//2), activation_fn=self.activation_fns[l]),
                         d_activation(outputs[l+1].view(B, K, 1), activation_fn=self.activation_fns[l+1]), layer.fc_p.weight.data),
-                dim=0)
+                dim=0))
 
             # Update the bias from the positive sublayer
             # \eta * output of layer l (an output of a bias neuron is 1) * derivative of layer l+1* derivative of layer l+1
-            dw_sum[l]['fc_p_bias'] += self.learning_rate * torch.sum(
-                d_activation(outputs[l+1], activation_fn=self.activation_fns[l+1]) * torch.sign(layer.fc_p.bias.data)*d,
-                dim=0)
-
+            buf.p_b.add_(self.learning_rate * torch.sum(
+                d_activation(outputs[l+1], activation_fn=self.activation_fns[l+1]) * torch.sign(layer.fc_p.bias.data)*d_pos,
+                dim=0))
 
             # ----- negative phase (d < 0) -----
             # d < 0 means that the output is larger than the target when using the MSE loss function
@@ -329,47 +322,45 @@ class EDLA(nn.Module):
             # Update the weight from the negative sublayer
             # The negative sublayer is the second half of the weight matrix
 
-            # Create a mask for samples where the global error signal is negative (i.e., output > target)
-            mask = (diff < 0)
             # Set diff to zero for samples where the global error signal is posive
-            # This is done to avoid updating the weights for these samples
-            d = diff * mask
+            # This is done to avoid updating the weights for these samples            
+            d_neg = (-diff).clamp_min(0)
 
-            d *= -1
             # d < 0, g'(a^{p, (l)}_j) > 0, z^{n, (l-1)}_i > 0, sign(w^{nn, (l)}_{ji})> 0
             # dw^{nn, (l)}_{ji} = \eta (-d) * g'(a^{p, (l)}_j) z^{n, (l-1)}_i sign(w^{nn, (l)}_{ji}) > 0
             # Therefore, w^{nn, (l)}_{ji} is updated in positive direction.
             # sign(w^{pn, (l)}_{ji}) < 0
             # dw^{nn, (l)}_{ji} = \eta (-d) * g'(a^{p, (l)}_j) z^{n, (l-1)}_i sign(w^{pn, (l)}_{ji}) < 0
             # Therefore, w^{pn, (l)}_{ji} is updated in negative direction.
-            dw_sum[l]['fc_n_weight'] += self.learning_rate * torch.sum(
-                self.dw(d, act_func(outputs[l][:, M//2:].view(B, 1, M//2), activation_fn=self.activation_fns[l]),
+            buf.n_w.add_(self.learning_rate * torch.sum(
+                self.dw(d_neg, act_func(outputs[l][:, M//2:].view(B, 1, M//2), activation_fn=self.activation_fns[l]),
                         d_activation(outputs[l+1].view(B, K, 1), activation_fn=self.activation_fns[l+1]), layer.fc_n.weight.data),
-                dim=0)
+                dim=0))
 
-            dw_sum[l]['fc_n_bias'] += self.learning_rate * torch.sum(
-                d_activation(outputs[l+1], activation_fn=self.activation_fns[l+1]) * torch.sign(layer.fc_n.bias.data)*d,
-                dim=0)
+            buf.n_b.add_(self.learning_rate * torch.sum(
+                d_activation(outputs[l+1], activation_fn=self.activation_fns[l+1]) * torch.sign(layer.fc_n.bias.data)*d_neg,
+                dim=0))
 
         # Update weights
         batch_size = diff.shape[0]
         for l in range(self.num_layers):
             layer = model.layers[l]
+            buf = self._dw_buf[l]
 
             if self.reduction == 'mean':
                 scale = 1.0 / batch_size
             elif self.reduction == 'sum':
-                scale
+                scale = 1.0
             else:
                 raise ValueError(f"Invalid reduction method: {self.reduction}. Supported values are 'mean' and 'sum'.")
 
             # --- excitatory weights & bias
-            layer.fc_p.weight.data += dw_sum[l]['fc_p_weight'] * scale
-            layer.fc_p.bias.data   += dw_sum[l]['fc_p_bias']   * scale
+            layer.fc_p.weight.add_(buf.p_w * scale)
+            layer.fc_p.bias  .add_(buf.p_b * scale)
             
             # --- inhibitory weights & bias
-            layer.fc_n.weight.data += dw_sum[l]['fc_n_weight'] * scale    
-            layer.fc_n.bias.data   += dw_sum[l]['fc_n_bias']   * scale
+            layer.fc_n.weight.add_(buf.n_w * scale)
+            layer.fc_n.bias  .add_(buf.n_b * scale)
               
 
 
