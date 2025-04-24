@@ -13,7 +13,7 @@ This repository contains an implementation of the **Error Diffusion Learning Alg
 
 ## References
 
-- Kazuhisa Fujita (2025) arxiv.
+- [Kazuhisa Fujita (2025) A Basic Evaluation of Neural Networks Trained with the Error Diffusion Learning Algorithm. arxiv:2504.14814.](https://arxiv.org/abs/2504.14814)
 - Isam Kaneko. 誤差拡散学習法のサンプルプログラム. https://web.archive.org/web/20000306212433/http://village.infoweb.ne.jp/~fwhz9346/ed.htm.
 
 ## License
