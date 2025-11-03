@@ -51,10 +51,6 @@ def act_func(x, activation_fn="Sigmoid", negative_slope=0.01):
         return torch.relu(x)
     elif activation_fn == "ReLU6":
         return torch.relu6(x)
-    elif activation_fn == "LeakyReLU":
-        return torch.leaky_relu(x, negative_slope=negative_slope)
-    elif activation_fn == "Tanh":
-        return torch.tanh(x)
     elif activation_fn == "None":
         return x
     else:
@@ -72,13 +68,6 @@ def d_activation(x, activation_fn="Sigmoid", negative_slope=0.01, beta=1.0):
     elif activation_fn == "ReLU6":
         # Derivative is 1 for 0 < x < 6, else 0
         return ((x > 0) & (x < 6)).to(x.dtype)
-    elif activation_fn == "LeakyReLU":
-        # For LeakyReLU: derivative is 1 where x > 0, else negative_slope
-        return torch.where(x > 0,
-                        torch.ones_like(x),
-                        torch.full_like(x, negative_slope))
-    if activation_fn == "Tanh":
-        return 1 - torch.tanh(x) ** 2
     elif activation_fn == "None":
         return torch.ones_like(x)
     else:
@@ -97,11 +86,12 @@ def d_loss(y, t, loss_fc="MSE"):
 # Definition of the ED Layer
 # ----------------------------------------------------------------
 class EDLayer(nn.Module):
-    def __init__(self, input_size, output_size):
+    def __init__(self, input_size, output_size, init_scale=0.0001):
         super(EDLayer, self).__init__()
 
         self.input_size = input_size
         self.output_size = output_size
+        self.init_scale = init_scale
 
         # Define two fully connected layers representing the positive and negative sublayers.
         self.fc_p = nn.Linear(self.input_size, output_size*2) # Positive
@@ -112,18 +102,18 @@ class EDLayer(nn.Module):
 
     # Initialize weights within specific ranges
     def initialize_weights(self):
-
+        
         # Initialize weights and biases for the positive layer
-        init.uniform_(self.fc_p.weight, a=-1, b=0)
-        init.uniform_(self.fc_p.bias,   a=-1, b=0)
+        init.uniform_(self.fc_p.weight, a=-self.init_scale, b=0)
+        init.uniform_(self.fc_p.bias,   a=-self.init_scale, b=0)
 
         # Set the first half of the weights and biases to positive values (w_pp >= 0)
         self.fc_p.weight.data[:self.output_size,:] *= -1
         self.fc_p.bias.data[:self.output_size]     *= -1
 
         # Initialize weights and biases for the negative layer
-        init.uniform_(self.fc_n.weight, a=0, b=1)
-        init.uniform_(self.fc_n.bias,   a=0, b=1)
+        init.uniform_(self.fc_n.weight, a=0, b=self.init_scale)
+        init.uniform_(self.fc_n.bias,   a=0, b=self.init_scale)
 
         # Set the first half of the weights and biases to negative values (w_pn <= 0)
         self.fc_n.weight.data[:self.output_size,:] *= -1
@@ -169,7 +159,7 @@ class EDLA(nn.Module):
     reduction:          Reduction method for weight updates ('mean' or 'sum')
     """
 
-    def __init__(self,input_size, hidden_size, output_size, hidden_layers = 1, activation_fn = "Sigmoid", last_activation_fn = "Sigmoid", loss_fc="MSE", learning_rate=0.1, reduction='mean'):
+    def __init__(self,input_size, hidden_size, output_size, hidden_layers = 1, activation_fn = "Sigmoid", last_activation_fn = "Sigmoid", loss_fc="MSE", learning_rate=0.1, init_scale=0.0001, reduction='mean'):
         super(EDLA, self).__init__()
 
         # -- Store hyperparameters --
@@ -186,12 +176,12 @@ class EDLA(nn.Module):
         # input -> AF -> o -> AF -> ... -> o -> AF
         self.layers = nn.ModuleList()
         if hidden_layers != 0:
-            self.layers.append(EDLayer(input_size, hidden_size))
+            self.layers.append(EDLayer(input_size, hidden_size, init_scale=init_scale))
             for i in range(hidden_layers-1):
-                self.layers.append(EDLayer(hidden_size, hidden_size))
-            self.layers.append(EDLayer(hidden_size, output_size))
+                self.layers.append(EDLayer(hidden_size, hidden_size, init_scale=init_scale))
+            self.layers.append(EDLayer(hidden_size, output_size, init_scale=init_scale))
         else:
-            self.layers.append(EDLayer(input_size, output_size))
+            self.layers.append(EDLayer(input_size, output_size, init_scale=init_scale))
 
         self.num_layers = len(self.layers)
 
@@ -279,15 +269,6 @@ class EDLA(nn.Module):
 
             M_half = M // 2
 
-            # ----- Avoid to change the sign of the weights -----
-            # This process is not used in the current implementation
-            # As long as using the Sigmoid and ReLU activation functions and the MSE loss function, signs of the weights are not changed.
-            # layer.fc_p.weight.data[:M_half].clamp_(min=0)
-            # layer.fc_p.weight.data[M_half:].clamp_(max=0)
-            # layer.fc_n.weight.data[:M_half].clamp_(max=0)
-            # layer.fc_n.weight.data[M_half:].clamp_(min=0)
-
-
             # ----- positive phase (d > 0) -----
             # d > 0 means that the output is smaller than the target when using the MSE loss function
             # Thus, we need to increase the positive neurons and decrease the negative neurons
@@ -302,14 +283,14 @@ class EDLA(nn.Module):
             # Update the weight from the positive sublayer (not including the bias)
             # \eta * output of layer l * derivative of layer l+1
             buf.p_w.add_(self.learning_rate * torch.sum(
-                self.dw(d_pos, act_func(outputs[l][:, :M_half].view(B, 1, M_half), activation_fn=self.activation_fns[l]),
-                        d_activation(outputs[l+1].view(B, K, 1), activation_fn=self.activation_fns[l+1]), layer.fc_p.weight.data),
+                self.dw(d_pos, act_func(outputs[l][:, :M_half].unsqueeze(1), activation_fn=self.activation_fns[l]),
+                        d_activation(outputs[l+1].unsqueeze(-1), activation_fn=self.activation_fns[l+1]), layer.fc_p.weight),
                 dim=0))
 
             # Update the bias from the positive sublayer
             # \eta * output of layer l (an output of a bias neuron is 1) * derivative of layer l+1* derivative of layer l+1
             buf.p_b.add_(self.learning_rate * torch.sum(
-                d_activation(outputs[l+1], activation_fn=self.activation_fns[l+1]) * torch.sign(layer.fc_p.bias.data)*d_pos,
+                d_activation(outputs[l+1], activation_fn=self.activation_fns[l+1]) * torch.sign(layer.fc_p.bias)*d_pos,
                 dim=0))
 
             # ----- negative phase (d < 0) -----
@@ -329,12 +310,12 @@ class EDLA(nn.Module):
             # dw^{nn, (l)}_{ji} = \eta (-d) * g'(a^{p, (l)}_j) z^{n, (l-1)}_i sign(w^{pn, (l)}_{ji}) < 0
             # Therefore, w^{pn, (l)}_{ji} is updated in negative direction.
             buf.n_w.add_(self.learning_rate * torch.sum(
-                self.dw(d_neg, act_func(outputs[l][:, M_half:].view(B, 1, M_half), activation_fn=self.activation_fns[l]),
-                        d_activation(outputs[l+1].view(B, K, 1), activation_fn=self.activation_fns[l+1]), layer.fc_n.weight.data),
+                self.dw(d_neg, act_func(outputs[l][:, M_half:].unsqueeze(1), activation_fn=self.activation_fns[l]),
+                        d_activation(outputs[l+1].unsqueeze(-1), activation_fn=self.activation_fns[l+1]), layer.fc_n.weight),
                 dim=0))
 
             buf.n_b.add_(self.learning_rate * torch.sum(
-                d_activation(outputs[l+1], activation_fn=self.activation_fns[l+1]) * torch.sign(layer.fc_n.bias.data)*d_neg,
+                d_activation(outputs[l+1], activation_fn=self.activation_fns[l+1]) * torch.sign(layer.fc_n.bias)*d_neg,
                 dim=0))
 
         # Update weights
@@ -360,6 +341,18 @@ class EDLA(nn.Module):
               
 
 
+            # ----- Avoid to change the sign of the weights -----
+            # This process is not used in the current implementation
+            # As long as using the Sigmoid and ReLU activation functions and the MSE loss function, signs of the weights are not changed.
+            # layer.fc_p.weight[:M_half].clamp_(min=0)
+            # layer.fc_p.weight[M_half:].clamp_(max=0)
+            # layer.fc_n.weight[:M_half].clamp_(max=0)
+            # layer.fc_n.weight[M_half:].clamp_(min=0)
+            # layer.fc_p.bias[:M_half].clamp_(min=0)
+            # layer.fc_p.bias[M_half:].clamp_(max=0)
+            # layer.fc_n.bias[:M_half].clamp_(max=0)
+            # layer.fc_n.bias[M_half:].clamp_(min=0)
+
 
 # --------------------------------------------------------------
 # EDLA_Multi - simple multi‑head wrapper
@@ -382,7 +375,7 @@ class EDLA_Multi(nn.Module):
     reduction:     Reduction method for weight updates ('mean' or 'sum')     
     """
 
-    def __init__(self,input_size, hidden_size, output_size, hidden_layers = 0, activation_fn = "Sigmoid", last_activation_fn = "Sigmoid", loss_fc="MSE", learning_rate=0.1, reduction='mean'):
+    def __init__(self,input_size, hidden_size, output_size, hidden_layers = 0, activation_fn = "Sigmoid", last_activation_fn = "Sigmoid", loss_fc="MSE", learning_rate=0.1, init_scale=0.0001, reduction='mean'):
         super(EDLA_Multi, self).__init__()
 
         self.input_size  = input_size
@@ -392,22 +385,25 @@ class EDLA_Multi(nn.Module):
         self.edlas = nn.ModuleList()
         for i in range(output_size):
             self.edlas.append(
-                EDLA(input_size=input_size, hidden_size = hidden_size, output_size=1, hidden_layers=hidden_layers, activation_fn=activation_fn, last_activation_fn=last_activation_fn, loss_fc=loss_fc,learning_rate=learning_rate,reduction=reduction))
+                EDLA(input_size=input_size, hidden_size = hidden_size, output_size=1, hidden_layers=hidden_layers, activation_fn=activation_fn, last_activation_fn=last_activation_fn, loss_fc=loss_fc,learning_rate=learning_rate, init_scale=init_scale, reduction=reduction))
 
     # -- Forward pass --
+    @torch.inference_mode()
+    @torch.compile()
     def forward(self, x):
-        with torch.no_grad():
-            batch_size = x.shape[0]
-            outputs = torch.zeros((batch_size, self.output_size)).to(x.device)
-            for n, edla in enumerate(self.edlas):
-                o, _ = edla(x)
-                outputs[:,n] = o.squeeze()
+        batch_size = x.shape[0]
+        outputs = x.new_empty((batch_size, self.output_size))
+        #outputs = torch.zeros((batch_size, self.output_size)).to(x.device)
+        for n, edla in enumerate(self.edlas):
+            o, _ = edla(x)
+            outputs[:,n] = o.squeeze()
 
         return outputs
 
     # -- Update weights of all EDLA networks --
+    @torch.inference_mode()
+    @torch.compile()
     def update(self, input_data, target):    
-        with torch.no_grad():
             for n, edla in enumerate(self.edlas):
                 edla.update(model=edla, input_data=input_data, target=target[:, n].view(-1,1))
 
@@ -434,7 +430,7 @@ if __name__ == "__main__":
     Y = torch.tensor([[0],[1],[1],[0]], dtype=torch.float32).to(device)
 
     # Model: 2 input, 4 hidden, 1 output, 1 hidden layer
-    model = EDLA_Multi(input_size=2, hidden_size=4, output_size=1, hidden_layers=1, activation_fn="Sigmoid", last_activation_fn="Sigmoid", loss_fc="MSE", learning_rate=1.0).to(device)
+    model = EDLA_Multi(input_size=2, hidden_size=1024, output_size=1, hidden_layers=2, activation_fn="Sigmoid", last_activation_fn="Sigmoid", loss_fc="MSE", learning_rate=1.0).to(device)
 
     epochs = 2000
 
