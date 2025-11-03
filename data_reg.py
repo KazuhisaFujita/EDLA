@@ -50,6 +50,11 @@ def load_regression_dataset(dataset_name, test_size=0.2, random_state=None, scal
         y = df['MEDV'].to_numpy()
 
     elif dataset_name in ('concrete', 'concrete compressive strength'):
+        import ssl
+
+        # SSL証明書の検証を無効にする設定
+        ssl._create_default_https_context = ssl._create_unverified_context
+
         url = "https://archive.ics.uci.edu/ml/machine-learning-databases/concrete/compressive/Concrete_Data.xls"
         df = pd.read_excel(url)
 
@@ -68,6 +73,11 @@ def load_regression_dataset(dataset_name, test_size=0.2, random_state=None, scal
         y = df['Concrete compressive strength(MPa, megapascals) '].to_numpy()
 
     elif dataset_name in ('energy', 'energy efficiency', 'enb2012'):
+        import ssl
+
+        # SSL証明書の検証を無効にする設定
+        ssl._create_default_https_context = ssl._create_unverified_context
+        
         url = "https://archive.ics.uci.edu/ml/machine-learning-databases/00242/ENB2012_data.xlsx"
         df = pd.read_excel(url)
         # 最初の8列が特徴量、9列目が Heating Load、10列目が Cooling Load となっている（ここでは Heating Load を使用）
