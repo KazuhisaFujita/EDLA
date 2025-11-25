@@ -257,6 +257,8 @@ class EDLA(nn.Module):
         for buf in self._dw_buf:
             buf.zero_()
 
+        batch_size = diff.shape[0]
+        
         # Loop through each layer and compute the weight updates
         for l in range(self.num_layers):
             layer = model.layers[l]
@@ -282,14 +284,14 @@ class EDLA(nn.Module):
 
             # Update the weight from the positive sublayer (not including the bias)
             # \eta * output of layer l * derivative of layer l+1
-            buf.p_w.add_(self.learning_rate * torch.sum(
+            buf.p_w.add_(torch.sum(
                 self.dw(d_pos, act_func(outputs[l][:, :M_half].unsqueeze(1), activation_fn=self.activation_fns[l]),
                         d_activation(outputs[l+1].unsqueeze(-1), activation_fn=self.activation_fns[l+1]), layer.fc_p.weight),
                 dim=0))
 
             # Update the bias from the positive sublayer
             # \eta * output of layer l (an output of a bias neuron is 1) * derivative of layer l+1* derivative of layer l+1
-            buf.p_b.add_(self.learning_rate * torch.sum(
+            buf.p_b.add_(torch.sum(
                 d_activation(outputs[l+1], activation_fn=self.activation_fns[l+1]) * torch.sign(layer.fc_p.bias)*d_pos,
                 dim=0))
 
@@ -309,35 +311,36 @@ class EDLA(nn.Module):
             # sign(w^{pn, (l)}_{ji}) < 0
             # dw^{nn, (l)}_{ji} = \eta (-d) * g'(a^{p, (l)}_j) z^{n, (l-1)}_i sign(w^{pn, (l)}_{ji}) < 0
             # Therefore, w^{pn, (l)}_{ji} is updated in negative direction.
-            buf.n_w.add_(self.learning_rate * torch.sum(
+            buf.n_w.add_(torch.sum(
                 self.dw(d_neg, act_func(outputs[l][:, M_half:].unsqueeze(1), activation_fn=self.activation_fns[l]),
                         d_activation(outputs[l+1].unsqueeze(-1), activation_fn=self.activation_fns[l+1]), layer.fc_n.weight),
                 dim=0))
 
-            buf.n_b.add_(self.learning_rate * torch.sum(
+            buf.n_b.add_(torch.sum(
                 d_activation(outputs[l+1], activation_fn=self.activation_fns[l+1]) * torch.sign(layer.fc_n.bias)*d_neg,
                 dim=0))
 
         # Update weights
-        batch_size = diff.shape[0]
+        if self.reduction == 'mean':
+            scale = 1.0 / batch_size
+        elif self.reduction == 'sum':
+            scale = 1.0
+        else:
+            raise ValueError(f"Invalid reduction method: {self.reduction}. Supported values are 'mean' and 'sum'.")
+
         for l in range(self.num_layers):
             layer = model.layers[l]
             buf = self._dw_buf[l]
 
-            if self.reduction == 'mean':
-                scale = 1.0 / batch_size
-            elif self.reduction == 'sum':
-                scale = 1.0
-            else:
-                raise ValueError(f"Invalid reduction method: {self.reduction}. Supported values are 'mean' and 'sum'.")
+
 
             # --- excitatory weights & bias
-            layer.fc_p.weight.add_(buf.p_w * scale)
-            layer.fc_p.bias  .add_(buf.p_b * scale)
+            layer.fc_p.weight.add_(self.learning_rate * buf.p_w * scale)
+            layer.fc_p.bias  .add_(self.learning_rate * buf.p_b * scale)
             
             # --- inhibitory weights & bias
-            layer.fc_n.weight.add_(buf.n_w * scale)
-            layer.fc_n.bias  .add_(buf.n_b * scale)
+            layer.fc_n.weight.add_(self.learning_rate * buf.n_w * scale)
+            layer.fc_n.bias  .add_(self.learning_rate * buf.n_b * scale)
               
 
 
